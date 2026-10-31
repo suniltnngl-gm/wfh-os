@@ -1,32 +1,20 @@
 <#
 .DESCRIPTION
-    Rebuilds the Windows File History exclusion list for the Projects workspace,
-    restarts the File History service, triggers a backup, and optionally
-    creates a lightweight Git snapshot (timestamped commit if changes exist).
-
-    Logs to logs\backup-history.log.
-
-.PARAMETER AutoCommit
-    If specified, creates a timestamped commit when changes are detected
-    (e.g. "backup: 2026-10-28 16:30").
-
-.PARAMETER LogOnly
-    If specified, only logs the action without triggering a backup.
-
-.EXAMPLE
-    .\Update-WFHExclusions.ps1 -AutoCommit
+    Rebuilds the Projects subtree exclusions used by Windows File History.
+    Exclusion discovery prunes excluded directories, so nested cache folders do
+    not create redundant rules.
 
 .EXAMPLE
     .\Update-WFHExclusions.ps1
 #>
 
+[CmdletBinding()]
 param(
-    [Switch]$AutoCommit
+    [string]$ProjectsRoot = "$HOME\Projects"
 )
 
-$ProjectsRoot = "C:\Users\sunilkr.DESKTOP-0AM7VDP\Projects"
+$ErrorActionPreference = "Stop"
 
-# Directories to exclude system-wide (regenerable artifacts).
 $ExcludeNames = @(
     ".git",
     "node_modules",
@@ -38,95 +26,98 @@ $ExcludeNames = @(
     "obj",
     ".coverage",
     "pytest_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    "htmlcov",
     ".next",
-    ".nuxt"
+    ".nuxt",
+    ".opencode-os-backup"
 )
 
-$configFile  = "$env:LOCALAPPDATA\Microsoft\Windows\FileHistory\Configuration\Config1.xml"
-$configFile2 = "$env:LOCALAPPDATA\Microsoft\Windows\FileHistory\Configuration\Config2.xml"
+$ProjectsRoot = (Resolve-Path -LiteralPath $ProjectsRoot).Path.TrimEnd('\')
+$configDirectory = Join-Path $env:LOCALAPPDATA "Microsoft\Windows\FileHistory\Configuration"
+$configFiles = @(
+    (Join-Path $configDirectory "Config1.xml"),
+    (Join-Path $configDirectory "Config2.xml")
+)
 
-if (-not (Test-Path $configFile)) {
-    Write-Warning "File History config not found at: $configFile"
-    exit 1
-}
-
-[xml]$cfg = Get-Content $configFile
-
-#
-# 1. Remove previously generated exclusions so we never duplicate entries.
-#
-$generated = $cfg.SelectNodes("//FolderExclude") |
-    Where-Object { $_.InnerText -like "$ProjectsRoot*" }
-
-foreach ($node in @($generated)) {
-    $node.ParentNode.RemoveChild($node) | Out-Null
-}
-
-#
-# 2. Discover exclusion targets under ProjectsRoot.
-#
-$newExclusions = 0
-Get-ChildItem $ProjectsRoot -Recurse -Directory -Force -ErrorAction SilentlyContinue |
-    Where-Object Name -in $ExcludeNames |
-    ForEach-Object {
-        $node = $cfg.CreateElement("FolderExclude")
-        $node.InnerText = $_.FullName
-        $cfg.DataProtectionUserConfig.AppendChild($node) | Out-Null
-        $newExclusions++
+foreach ($configFile in $configFiles) {
+    if (-not (Test-Path -LiteralPath $configFile -PathType Leaf)) {
+        throw "File History configuration not found: $configFile"
     }
-
-Write-Host "Excluded $newExclusions directories:"
-Get-ChildItem $ProjectsRoot -Recurse -Directory -Force -ErrorAction SilentlyContinue |
-    Where-Object Name -in $ExcludeNames |
-    ForEach-Object { Write-Host "  $($_.FullName)" }
-
-$cfg.Save($configFile)
-if (Test-Path $configFile2) { $cfg.Save($configFile2) }
-
-#
-# 3. Restart the File History service so it picks up the new exclusions.
-#    Run as administrator for this to succeed.
-#
-try {
-    Restart-Service fhsvc -ErrorAction Stop
-} catch {
-    Write-Warning "Could not restart fhsvc. Run this script as Administrator."
 }
 
-Write-Host ""
-Write-Host "✅ File History exclusions updated and service restarted."
+$excludeSet = [System.Collections.Generic.HashSet[string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase
+)
+foreach ($name in $ExcludeNames) {
+    [void]$excludeSet.Add($name)
+}
 
-#
-# 4. Run a backup now so the new configuration is exercised immediately.
-#    Caller must run: fhmanagew.exe -backupnow
-#
-Write-Host "Run a backup now:"
-Write-Host "    fhmanagew.exe -backupnow"
+$targets = [System.Collections.Generic.List[string]]::new()
+$pending = [System.Collections.Generic.Stack[string]]::new()
+$pending.Push($ProjectsRoot)
 
-#
-# 5. Optional: Auto Git snapshot if -AutoCommit was specified
-#
-if ($AutoCommit) {
-    Write-Host ""
-    Write-Host "Auto-committing Git changes..."
-
-    $origLocation = Get-Location
-    try {
-        Set-Location $ProjectsRoot
-
-        $status = git status --short
-        if ($status) {
-            $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm'
-            $commitMsg = "backup: $timestamp"
-
-            Write-Host "Changes detected. Committing: $commitMsg"
-            git add -A
-            git commit -m $commitMsg
-            Write-Host "Committed successfully."
-        } else {
-            Write-Host "No changes to commit."
+while ($pending.Count -gt 0) {
+    $current = $pending.Pop()
+    foreach ($directory in Get-ChildItem -LiteralPath $current -Directory -Force) {
+        if ($excludeSet.Contains($directory.Name) -or $directory.Name.EndsWith(".egg-info", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $targets.Add($directory.FullName.TrimEnd('\'))
+            continue
         }
-    } finally {
-        Set-Location $origLocation
+
+        if (($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+            $pending.Push($directory.FullName)
+        }
     }
+}
+
+$desired = @($targets | Sort-Object -Unique)
+$configChanged = $false
+
+foreach ($configFile in $configFiles) {
+    [xml]$config = Get-Content -LiteralPath $configFile
+    $existingNodes = @(
+        $config.SelectNodes("//FolderExclude") |
+            Where-Object {
+                $_.InnerText.Equals($ProjectsRoot, [StringComparison]::OrdinalIgnoreCase) -or
+                $_.InnerText.StartsWith("$ProjectsRoot\", [StringComparison]::OrdinalIgnoreCase)
+            }
+    )
+    $existingPaths = @($existingNodes | ForEach-Object { $_.InnerText } | Sort-Object -Unique)
+
+    $same = $existingNodes.Count -eq $desired.Count -and $existingPaths.Count -eq $desired.Count
+    if ($same) {
+        for ($index = 0; $index -lt $desired.Count; $index++) {
+            if (-not $existingPaths[$index].Equals($desired[$index], [StringComparison]::OrdinalIgnoreCase)) {
+                $same = $false
+                break
+            }
+        }
+    }
+
+    if ($same) {
+        continue
+    }
+
+    foreach ($node in $existingNodes) {
+        [void]$node.ParentNode.RemoveChild($node)
+    }
+
+    foreach ($path in $desired) {
+        $node = $config.CreateElement("FolderExclude")
+        $node.InnerText = $path
+        [void]$config.DataProtectionUserConfig.AppendChild($node)
+    }
+
+    $config.Save($configFile)
+    $configChanged = $true
+}
+
+Write-Host "Projects exclusion rules: $($desired.Count) unique directories."
+if ($configChanged) {
+    Write-Host "File History exclusions updated. The next backup run will use the refreshed configuration."
+} else {
+    Write-Host "Exclusions are already current."
 }

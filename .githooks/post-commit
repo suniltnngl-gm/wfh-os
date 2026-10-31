@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+hook_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_path=$(cygpath -w "$hook_dir/../scripts/Clean-CommittedSnapshots.ps1")
+repo_path=$(cygpath -w "$(git rev-parse --show-toplevel)")
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$script_path" -RepositoryRoot "$repo_path"

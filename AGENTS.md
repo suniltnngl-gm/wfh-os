@@ -2,45 +2,82 @@
 
 Guidance for AI agents and humans working in this workspace.
 
-> This is the primary protected workspace. Working files are guarded by **two
-> independent systems**: **Git** (history, branches, commits) and **Windows File
-> History** (uncommitted work, accidental edits/deletes, bad `git` operations).
-> Preserve both.
+> Protect work with Git commits, verified pre-edit snapshots in the external
+> `.opencode-os-backup` folder, and Windows File History as an independent
+> background recovery layer.
 
 ## Required workflow
 
-**Before making any edit to workspace files, run the Windows File History
-backup first.** This ensures a version of the pre-edit file is captured, so the
-old state remains recoverable even if the edit is later reverted or lost.
+**Before editing an existing file, save a verified snapshot outside the
+repository:**
 
-Before running the backup:
+```powershell
+.\scripts\Save-PreEditSnapshot.ps1 -Paths @(
+    "AGENTS.md",
+    "scripts\Start-DeltaOpsBackup.ps1"
+)
+```
 
-1. Ensure the exclusion list (below) is correctly applied.
-2. Run the backup.
-3. Proceed with the edit.
+Paths may be repository-relative or absolute paths inside the repository.
+Snapshots are written to
+`C:\Users\sunilkr.DESKTOP-0AM7VDP\Projects\other\.opencode-os-backup\<repo>\`
+using the original directory layout and names such as `file.ps1.bak1`,
+`file.ps1.bak2`. Each copy is SHA-256 verified before editing. New files have
+no pre-edit content to snapshot.
+
+The current File History policy excludes
+`C:\Users\sunilkr.DESKTOP-0AM7VDP\Projects\other\.opencode-os-backup`; the
+external `.bakN` copies are therefore a separate local safety layer, not files
+backed up by WFH. File History covers included source-project paths, subject
+to its own exclusions and the actual version check.
+
+The save command first reports each path's Git index/ignore state, File History
+include/exclude rule and available version, and external snapshot count. To
+audit a repository at any time:
+
+```powershell
+.\scripts\Test-ProtectionCoverage.ps1 -ShowExclusions
+.\scripts\Test-ProtectionCoverage.ps1 -Paths @("AGENTS.md")
+```
+
+Git and File History exclusions are separate policies, not mirrored
+automatically. Git-ignore rules keep files out of commits; File History
+exclusions omit folders from backup. Review them independently before adding
+or changing either policy.
+
+The pre-commit hook requires snapshots for staged modifications, deletions,
+and rename sources, and rejects staged content that differs from the working
+tree. The post-commit hook removes snapshots only for paths included in the
+successful commit. Snapshots for other uncommitted work remain. If cleanup
+fails, the commit has still succeeded; rerun
+`scripts\Clean-CommittedSnapshots.ps1` to clean the latest commit.
 
 ### Automation
 
-Use the scripts in `scripts/` to refresh exclusions and back up in one step:
+File History scripts remain available for manual maintenance and independent
+backup checks; they are not required before edits or run by Git hooks:
 
 ```powershell
-# Refresh exclusions, restart File History, and run a backup
-.\scripts\Update-WFHExclusions.ps1
-fhmanagew.exe -backupnow
-
-# Optional: Git snapshot (review changes before committing)
+# Optional File History backup
 .\scripts\Start-DeltaOpsBackup.ps1
+
+# Optional exact File History verification
+.\scripts\Start-DeltaOpsBackup.ps1 -Paths @("C:\path\to\file")
+
+# Optional File History activity check
+.\scripts\Schedule-WFHBackup.ps1
 ```
 
-**Safe Git alias** — review changes before adding, instead of `git add .`:
+Install the shared pre-commit and post-commit hooks once in the WFH and
+adapter repositories:
 
 ```powershell
-function git-safe {
-    git status
-    Write-Host ""
-    Write-Host "Review changes before adding."
-}
+.\scripts\Install-WFHPreCommitHook.ps1
 ```
+
+Git hooks do not invoke File History or create snapshots automatically. Save
+snapshots before editing; the pre-commit hook verifies them and the
+post-commit hook cleans committed snapshots.
 
 ## Layout
 
@@ -59,8 +96,8 @@ Exclude regenerable artifacts so backup storage stays lean:
 | `.git` | Git history is protected by Git itself |
 | `node_modules` | Rebuildable |
 | `.venv`, `__pycache__` | Rebuildable |
-| `dist`, `build`, `bin`, `obj` | Build output |
-| `.coverage`, `pytest_cache` | Test artifacts |
+| `.coverage`, `pytest_cache`, `.pytest_cache`, `.ruff_cache`, `.mypy_cache`, `htmlcov` | Test and lint artifacts |
+| `dist`, `build`, `bin`, `obj`, `*.egg-info` | Build output and package metadata |
 | `.next`, `.nuxt` | Framework build output |
 
 **Do not auto-exclude anything solely because it appears in `.gitignore`.**
@@ -98,28 +135,31 @@ git checkout .
 git restore .
 ```
 
-When in doubt, back up uncommitted work first — File History is the safety net,
-but prefer not to rely on it.
+When in doubt, run `Save-PreEditSnapshot.ps1` for the exact existing files
+before editing. File History is an independent recovery layer, not a substitute
+for an intentional pre-edit snapshot.
 
 ## Recovery hierarchy
 
-1. **Git committed history** — source of truth for all commits, branches, history  
-2. **Windows File History** — safety net for uncommitted work, accidental edits, bad `git` operations  
-3. **Remote Git repository** — disaster recovery when local Git is corrupted  
-4. **E: drive store** — local recovery when everything else fails  
+1. **Git committed history** — source of truth for all commits, branches, history
+2. **External `.bakN` snapshots** — short-term recovery for uncommitted edits
+3. **Windows File History** — recovery for included source files; it does not back up the excluded `.opencode-os-backup` snapshot store
+4. **Remote Git repository** — disaster recovery when local Git is corrupted
+5. **E: drive store** — local recovery when everything else fails
 
 > Never assume a backup exists.  
 > Always verify with a real restore test.
 
 ## Validation
 
-After changing backup configuration, prove it works:
+After changing snapshot or hook logic, use a temporary Git repository to verify
+that:
 
-1. Create a test file in the workspace.
-2. Run File History.
-3. Confirm the file appears under
-   `FileHistory\<user>\<computer>\Data`.
-4. Confirm excluded content is **not** backed up.
-5. Confirm versioned copies are created for modified files.
+1. Repeated pre-edit saves create `.bak1`, `.bak2`, and exact SHA-256 matches.
+2. Pre-commit rejects modified files without snapshots and accepts protected
+   staged files.
+3. Failed commits retain snapshots.
+4. Successful commits remove snapshots only for committed paths.
 
-Never assume a backup configuration works without validation.
+Run File History health and restore checks separately when changing its
+configuration; Git hooks do not invoke File History.

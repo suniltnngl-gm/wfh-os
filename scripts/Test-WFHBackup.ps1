@@ -1,155 +1,174 @@
 <#
 .DESCRIPTION
-    Verifies the Windows File History backup for the delta-ops workspace.
-    Checks service status, config, recent backup age, versioned copies, and
-    ensures excluded folders are absent from the backup store.
+    Checks File History service/target health, recent activity, redundant project
+    exclusions, and optional per-file SHA-256 backup copies.
 
 .EXAMPLE
-    .\Test-WFHBackup.ps1
-
-    # Returns $true if all checks pass, $false otherwise.
+    .\Test-WFHBackup.ps1 -Paths @("$HOME\Projects\wfh-os\AGENTS.md")
 #>
 
+[CmdletBinding()]
 param(
-    # How many hours back the latest backup should be (default: 24)
-    [int]$MaxHoursOld = 24,
-
-    # Path to the Projects root (default: %HOME%\Projects)
-    [string]$ProjectsRoot = "$HOME\Projects"
+    [string]$ProjectsRoot = "$HOME\Projects",
+    [string[]]$Paths = @(),
+    [ValidateRange(1, 168)]
+    [int]$MaxActivityAgeMinutes = 20,
+    [switch]$SkipActivityCheck
 )
 
-# Output a simple pass/fail summary
-function Write-Result {
-    param($Passed, $Message)
+$ErrorActionPreference = "Stop"
+$failures = [System.Collections.Generic.List[string]]::new()
+
+function Write-Check {
+    param(
+        [Parameter(Mandatory)]
+        [bool]$Passed,
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
+
     if ($Passed) {
-        Write-Host "✅ $Message"
+        Write-Host "[PASS] $Message"
     } else {
-        Write-Host "❌ $Message"
+        Write-Host "[FAIL] $Message"
+        $script:failures.Add($Message)
     }
-    $global:Results += @{ Passed = $Passed; Message = $Message }
 }
 
-# Initialise results
-$global:Results = @()
+function Get-BackupPath {
+    param([Parameter(Mandatory)][string]$SourcePath)
 
-Write-Host "=== File History Backup Verification ==="
-Write-Host ""
-
-# 1. File History service running
-$fhSvc = Get-Service fhsvc -ErrorAction SilentlyContinue
-if ($fhSvc -and $fhSvc.Status -eq 'Running') {
-    Write-Result $true "File History service is running"
-} else {
-    Write-Result $false "File History service is NOT running (status: $($fhSvc?.Status))"
-}
-
-# 2. Target drive / Projects root available
-if (Test-Path $ProjectsRoot) {
-    Write-Result $true "Projects root exists at $ProjectsRoot"
-} else {
-    Write-Result $false "Projects root NOT found at $ProjectsRoot"
-}
-
-# 3. Config contains Projects
-$configFile = "$env:LOCALAPPDATA\Microsoft\Windows\FileHistory\Configuration\Config1.xml"
-if (Test-Path $configFile) {
-    [xml]$cfg = Get-Content $configFile
-    $hasProjects = $cfg.SelectNodes("//FolderExclude") |
-        Where-Object { $_.InnerText -like "$ProjectsRoot*" } |
-        Measure-Object | ForEach-Object { $_.Count -gt 0 }
-    if ($hasProjects) {
-        Write-Result $true "Config contains exclusions for Projects root"
-    } else {
-        Write-Result $false "Config does NOT contain Projects root exclusions"
+    $volume = Get-Volume -FileSystemLabel "WFH" -ErrorAction Stop
+    if (@($volume).Count -ne 1 -or -not $volume.DriveLetter) {
+        throw "Expected one mounted File History volume labeled WFH."
     }
-} else {
-    Write-Result $false "File History config not found at $configFile"
+
+    $sourceFullPath = [System.IO.Path]::GetFullPath($SourcePath)
+    $systemRoot = [System.IO.Path]::GetPathRoot($sourceFullPath)
+    $drive = $systemRoot.TrimEnd(':\')
+    $relative = $sourceFullPath.Substring($systemRoot.Length).TrimStart('\')
+    return Join-Path "$($volume.DriveLetter):\FileHistory\$env:USERNAME\$env:COMPUTERNAME\Data" (
+        Join-Path $drive $relative
+    )
 }
 
-# 4. Latest backup newer than MaxHoursOld
-# File History stores versioned copies under the user's Data folder.
-# Typical path: FileHistory\<user>\<computer>\Data
-$fhDataRoot = "$env:SystemDrive\Users\$env:USERNAME\FileHistory\*"
-$fhDataDirs = Get-ChildItem $fhDataRoot -Directory -ErrorAction SilentlyContinue
-$recentBackup = $false
+function Get-FileHistoryCopies {
+    param([Parameter(Mandatory)][string]$SourcePath)
 
-if ($fhDataDirs) {
-    # Look for the most recently modified folder under the Data path
-    $latest = $fhDataDirs |
-        Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-
-    if ($latest) {
-        $ageHours = (Get-Date - $latest.LastWriteTime).TotalHours
-        if ($ageHours -le $MaxHoursOld) {
-            $recentBackup = $true
-            Write-Result $true "Latest backup is $ageHours:h ago (within $MaxHoursOld hours)"
-        } else {
-            Write-Result $false "Latest backup is $ageHours:h old (older than $MaxHoursOld hours)"
-        }
-    } else {
-        Write-Result $false "No backup data folders found under $fhDataRoot"
+    $backupPath = Get-BackupPath -SourcePath $SourcePath
+    $directory = Split-Path -Parent $backupPath
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        return @()
     }
-} else {
-    Write-Result $false "File History Data root not found at $fhDataRoot"
+
+    $fileName = [System.IO.Path]::GetFileName($backupPath)
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+    $extension = [System.IO.Path]::GetExtension($fileName)
+    $versionPattern = '^' + [regex]::Escape($stem) + ' \(.+\)' + [regex]::Escape($extension) + '$'
+
+    return @(
+        Get-ChildItem -LiteralPath $directory -File |
+            Where-Object { $_.Name -eq $fileName -or $_.Name -match $versionPattern }
+    )
 }
 
-# 5. Versioned copy of a test file exists
-# Check that at least one file under the Data folder was modified recently
-if ($recentBackup) {
-    $testFilePattern = "$ProjectsRoot\*.ps1"
-    $testFiles = Get-ChildItem $testFilePattern -ErrorAction SilentlyContinue
-    if ($testFiles) {
-        $recentTestFile = $testFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        if ($recentTestFile) {
-            $fileAgeHours = (Get-Date - $recentTestFile.LastWriteTime).TotalHours
-            if ($fileAgeHours -le $MaxHoursOld) {
-                Write-Result $true "Versioned test file exists and was modified $fileAgeHours:h ago"
-            } else {
-                Write-Result $warning "Test file exists but was modified $fileAgeHours:h ago (older than $MaxHoursOld hours)"
+function Get-FileSha256 {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace("-", "")
+    } finally {
+        $algorithm.Dispose()
+        $stream.Dispose()
+    }
+}
+
+$ProjectsRoot = (Resolve-Path -LiteralPath $ProjectsRoot).Path.TrimEnd('\')
+$service = Get-Service -Name fhsvc -ErrorAction SilentlyContinue
+Write-Check -Passed ($null -ne $service -and $service.Status -eq "Running") `
+    -Message "File History service is running."
+
+try {
+    $volume = Get-Volume -FileSystemLabel "WFH" -ErrorAction Stop
+    $volumeHealthy = @($volume).Count -eq 1 -and
+        $volume.DriveLetter -and
+        $volume.HealthStatus -eq "Healthy" -and
+        $volume.OperationalStatus -contains "OK"
+    Write-Check -Passed $volumeHealthy -Message "WFH target volume is mounted and healthy."
+} catch {
+    Write-Check -Passed $false -Message "Could not verify WFH target volume: $($_.Exception.Message)"
+}
+
+if (-not $SkipActivityCheck) {
+    try {
+        $activity = Get-WinEvent -FilterHashtable @{
+            LogName = "Microsoft-Windows-FileHistory-Core/WHC"
+            Id = 100
+            StartTime = (Get-Date).AddMinutes(-$MaxActivityAgeMinutes)
+        } -MaxEvents 1 -ErrorAction Stop
+        Write-Check -Passed ($null -ne $activity) `
+            -Message "File History reported an operational state change within $MaxActivityAgeMinutes minutes."
+    } catch {
+        Write-Check -Passed $false `
+            -Message "No recent File History operational event was found: $($_.Exception.Message)"
+    }
+}
+
+$configFile = Join-Path $env:LOCALAPPDATA "Microsoft\Windows\FileHistory\Configuration\Config1.xml"
+if (Test-Path -LiteralPath $configFile -PathType Leaf) {
+    [xml]$config = Get-Content -LiteralPath $configFile
+    $projectExclusions = @(
+        $config.SelectNodes("//FolderExclude") |
+            Where-Object {
+                $_.InnerText.StartsWith("$ProjectsRoot\", [StringComparison]::OrdinalIgnoreCase)
+            } |
+            ForEach-Object { $_.InnerText.TrimEnd('\') }
+    )
+    $exclusions = @($projectExclusions | Sort-Object -Unique)
+    $hasDuplicates = $projectExclusions.Count -ne $exclusions.Count
+
+    $redundant = [System.Collections.Generic.List[string]]::new()
+    foreach ($candidate in $exclusions) {
+        foreach ($parent in $exclusions) {
+            if ($candidate.Length -gt $parent.Length -and
+                $candidate.StartsWith("$parent\", [StringComparison]::OrdinalIgnoreCase)) {
+                $redundant.Add($candidate)
+                break
             }
+        }
+    }
+    Write-Check -Passed (-not $hasDuplicates -and $redundant.Count -eq 0) `
+        -Message "Project exclusions contain no duplicate or nested redundant rules."
+} else {
+    Write-Check -Passed $false -Message "File History Config1.xml was not found."
+}
+
+foreach ($path in $Paths) {
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($path)
+        $copies = @(Get-FileHistoryCopies -SourcePath $fullPath)
+        if (Test-Path -LiteralPath $fullPath -PathType Leaf) {
+            $expectedHash = Get-FileSha256 -Path $fullPath
+            $matchingCopy = $copies | Where-Object {
+                (Get-FileSha256 -Path $_.FullName) -eq $expectedHash
+            } | Select-Object -First 1
+            Write-Check -Passed ($null -ne $matchingCopy) `
+                -Message "Current file content is backed up: $fullPath"
         } else {
-            Write-Result $false "No test .ps1 files found in Projects"
+            Write-Check -Passed ($copies.Count -gt 0) `
+                -Message "A File History version exists for deleted file: $fullPath"
         }
-    } else {
-        Write-Result $warning "No .ps1 test files found in Projects (skipping file-timestamp check)"
+    } catch {
+        Write-Check -Passed $false -Message "Could not verify backup for '$path': $($_.Exception.Message)"
     }
 }
 
-# 6. Excluded folders not present in backup
-$ExcludeNames = @(".git", "node_modules", ".venv", "__pycache__", "dist", "build", "bin", "obj", ".coverage", "pytest_cache", ".next", ".nuxt")
-$fhBackupRoot = "$env:SystemDrive\Users\$env:USERNAME\FileHistory"
-
-$excludedFound = $false
-if (Test-Path $fhBackupRoot) {
-    $foldersInBackup = Get-ChildItem $fhBackupRoot -Recurse -Directory -ErrorAction SilentlyContinue |
-        ForEach-Object { $_.Name }
-
-    foreach ($ename in $ExcludeNames) {
-        if ($foldersInBackup -contains $ename -or $foldersInBackup -match "^$ename$") {
-            $excludedFound = $true
-            Write-Result $false "Excluded folder '$ename' found in backup store (should be excluded)"
-        }
-    }
-
-    if (-not $excludedFound) {
-        Write-Result $true "No excluded folders (.git, node_modules, etc.) found in backup store"
-    }
-} else {
-    Write-Result $warning "File History backup root not found; cannot verify excluded folders"
-}
-
-# Summary
-Write-Host ""
-$passCount = ($global:Results | Where-Object { $_.Passed }).Count
-$totalCount = $global:Results.Count
-Write-Host "=== Summary: $passCount of $total checks passed ==="
-
-if ($passCount -eq $totalCount) {
-    Write-Host "All checks passed! File History backup is valid."
-    exit 0
-} else {
-    Write-Host "Some checks failed. Review above."
+if ($failures.Count -gt 0) {
+    Write-Error "$($failures.Count) File History check(s) failed."
     exit 1
 }
+
+Write-Host "All requested File History checks passed."
+exit 0

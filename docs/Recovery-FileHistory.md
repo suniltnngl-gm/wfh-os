@@ -39,21 +39,52 @@ git push origin main
 
 ## Scenario: File History service crashed
 
-**Fix:** Restart the service and re-run the backup.
+**Fix:** Use the WFH workflow to refresh exclusions, request a backup, and
+wait for File History state transitions. Avoid manually restarting `fhsvc`;
+service control may require elevation.
 
 ```powershell
-# Restart File History service
-Restart-Service fhsvc
-
-# Run backup
-fhmanagew.exe -backupnow
+.\scripts\Start-DeltaOpsBackup.ps1
 ```
+
+---
+
+## Before editing existing files
+
+```powershell
+.\scripts\Save-PreEditSnapshot.ps1 -Paths @(
+    "scripts\Test-WFHBackup.ps1",
+    "AGENTS.md"
+)
+```
+
+Run before each new editing pass. The script verifies an exact SHA-256 copy
+outside the repository and increments suffixes (`.bak1`, `.bak2`) so earlier
+versions remain available until commit.
+
+The WFH configuration excludes
+`C:\Users\sunilkr.DESKTOP-0AM7VDP\Projects\other\.opencode-os-backup`; `.bakN`
+copies are not themselves protected by File History. WFH remains a separate
+recovery layer for included source files.
+
+It also reports whether each path is Git-tracked, Git-ignored or untracked,
+whether File History configuration includes/excludes it, whether a File
+History version exists, and the current external snapshot count. Run
+`Test-ProtectionCoverage.ps1 -ShowExclusions` to inspect Git and File History
+rules separately.
+
+The pre-commit hook requires snapshots for modified/deleted files and checks
+that staged contents match the working tree. The post-commit hook removes
+snapshots only for paths included in the successful commit. File History
+remains an independent recovery layer and can be requested manually with
+`Start-DeltaOpsBackup.ps1`.
 
 ---
 
 ## Recovery hierarchy (order of operations)
 
 1. **Git committed history** — first attempt for committed work
-2. **File History** — for uncommitted work before `git restore`/`reset`
-3. **Remote Git repository** — if local Git is corrupted
-4. **E: drive store** — local recovery when everything else fails
+2. **External `.bakN` snapshots** — short-term recovery for uncommitted edits
+3. **File History** — independent recovery if local files or snapshots are lost
+4. **Remote Git repository** — if local Git is corrupted
+5. **E: drive store** — local recovery when everything else fails

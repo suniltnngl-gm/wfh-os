@@ -41,7 +41,7 @@ Disaster recovery scenarios covering **local** and **remote** failures.
    ```bash
    git clone <original-repo-url>
    ```
-2. **File History** — restore C: drive if available, then run `Update-WFHExclusions.ps1 -AutoCommit`
+2. **File History / external snapshots** — restore C: drive if available; check `.bakN` files under `.opencode-os-backup` for uncommitted edits.
 3. **E: drive** — restore the local backup store if your E: drive is portable.
 
 ---
@@ -49,9 +49,10 @@ Disaster recovery scenarios covering **local** and **remote** failures.
 ## Recovery hierarchy (order of operations)
 
 1. **Git committed history** — first attempt for committed work
-2. **File History** — for uncommitted work before `git restore`/`reset`
-3. **Remote Git repository** — if local Git is corrupted
-4. **E: drive store** — local recovery when everything else fails
+2. **External `.bakN` snapshots** — short-term recovery for uncommitted edits
+3. **File History** — independent recovery if local files or snapshots are lost
+4. **Remote Git repository** — if local Git is corrupted
+5. **E: drive store** — local recovery when everything else fails
 
 > 💡 **Pro tip:** Keep your Git remote URL in a secure location (e.g., secrets manager). If you lose access to the remote, you may need to ask the repo owner to re-share access or manually copy backups from the E: drive.
 
@@ -76,17 +77,17 @@ function git-log {
 ### File History helpers
 
 ```powershell
-# Restart service
-Restart-Service fhsvc
-
-# Run backup
-fhmanagew.exe -backupnow
+# Refresh exclusions, request a backup, and wait for File History activity
+.\scripts\Start-DeltaOpsBackup.ps1
 
 # List backups
-Get-ChildItem "FileHistory\$env:USERNAME\*" -Directory
+$volume = Get-Volume -FileSystemLabel "WFH"
+Get-ChildItem "$($volume.DriveLetter):\FileHistory\$env:USERNAME\$env:COMPUTERNAME\Data" -Directory
 ```
 
-> 🚀 **Remember:** After any disaster recovery, run `Update-WFHExclusions.ps1 -AutoCommit` to get back to a known-good exclusion state.
+> After recovery, verify the restored Git worktree, inspect any external
+> `.bakN` snapshots, and optionally run `Start-DeltaOpsBackup.ps1` to request
+> an independent File History backup. It never creates Git commits.
 
 ---
 
